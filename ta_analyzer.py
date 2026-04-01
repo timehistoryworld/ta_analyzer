@@ -528,7 +528,7 @@ with tab2:
             y=wl_sub,
             colorscale=colorscale,
             zmin=zmin, zmax=zmax,
-            colorbar=dict(title="ΔOD", titleside="right"),
+            colorbar=dict(title=dict(text="ΔOD", side="right")),
             hovertemplate="λ: %{y:.1f} nm<br>t: %{customdata:.2f} ps<br>ΔOD: %{z:.5f}<extra></extra>",
             customdata=np.tile(t_sub, (len(wl_sub), 1)),
         ))
@@ -1016,7 +1016,7 @@ with tab4:
                 colorscale="RdBu_r",
                 zmin=-np.nanmax(np.abs(data_svd)) * 0.8,
                 zmax=np.nanmax(np.abs(data_svd)) * 0.8,
-                colorbar=dict(title="ΔOD"),
+                colorbar=dict(title=dict(text="ΔOD")),
             ))
             fig_recon.update_layout(
                 title=f"Reconstructed (N={n_recon})",
@@ -1039,7 +1039,7 @@ with tab4:
                 colorscale="RdBu_r",
                 zmin=-np.nanmax(np.abs(residual)),
                 zmax=np.nanmax(np.abs(residual)),
-                colorbar=dict(title="ΔOD"),
+                colorbar=dict(title=dict(text="ΔOD")),
             ))
             fig_resid.update_layout(
                 title=f"Residual (RMSE: {np.sqrt(np.mean(residual**2)):.6f})",
