@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, least_squares
 from scipy.signal import savgol_filter
 from scipy.linalg import svd
 from scipy.interpolate import interp1d
@@ -104,6 +104,135 @@ def fit_kin(t, y, mt="bi", ts=0.0):
         return {"params":dict(zip(pn,po)),"r_squared":r2,"t_fit":tf,"y_fit":yf,"y_calc":yc,"residuals":yf-yc},po,pn
     except Exception as e: return None,None,str(e)
 
+# ── Global Analysis helpers (scipy-based) ──
+def _ga_parallel_C(t, taus):
+    """Concentration matrix for parallel (independent) decay: C_i(t) = exp(-t/tau_i)"""
+    n = len(taus)
+    C = np.zeros((len(t), n))
+    for i, tau in enumerate(taus):
+        C[:, i] = np.exp(-t / tau)
+    return C
+
+def _ga_sequential_C(t, taus):
+    """Concentration matrix for sequential decay: S1->S2->...->Sn.
+    Uses analytic solution for first-order sequential kinetics."""
+    n = len(taus)
+    rates = [1.0 / tau for tau in taus]
+    C = np.zeros((len(t), n))
+    C[:, 0] = np.exp(-rates[0] * t)
+    for j in range(1, n):
+        for i in range(j + 1):
+            prod_coeff = 1.0
+            for m in range(j):
+                prod_coeff *= rates[m]
+            denom = 1.0
+            for m in range(j + 1):
+                if m != i:
+                    diff = rates[m] - rates[i]
+                    if abs(diff) < 1e-12:
+                        diff = np.sign(diff) * 1e-12 if diff != 0 else 1e-12
+                    denom *= diff
+            C[:, j] += (prod_coeff / denom) * np.exp(-rates[i] * t)
+    return C
+
+def _ga_convolve_irf(C, t, irf_sigma):
+    """Approximate IRF convolution via Gaussian filter."""
+    from scipy.ndimage import gaussian_filter1d
+    if irf_sigma <= 0 or len(t) < 3:
+        return C
+    dt = np.median(np.diff(t))
+    if dt <= 0:
+        return C
+    sigma_pts = irf_sigma / dt
+    if sigma_pts < 0.5:
+        return C
+    C_conv = np.copy(C)
+    for j in range(C.shape[1]):
+        C_conv[:, j] = gaussian_filter1d(C[:, j], sigma_pts, mode='constant', cval=0.0)
+    return C_conv
+
+def _ga_build_C(t, taus, model_type, use_irf, irf_center, irf_sigma):
+    """Build concentration matrix with optional IRF."""
+    t_shifted = t - irf_center if use_irf else t
+    t_shifted = np.maximum(t_shifted, 0.0)
+    if model_type == "parallel":
+        C = _ga_parallel_C(t_shifted, taus)
+    else:
+        C = _ga_sequential_C(t_shifted, taus)
+    if use_irf and irf_sigma > 0:
+        C = _ga_convolve_irf(C, t, irf_sigma)
+    return C
+
+def _ga_residuals_flat(params, t, D, n_comp, model_type, use_irf):
+    """Compute flattened residuals for least_squares."""
+    taus = np.abs(params[:n_comp])
+    taus = np.clip(taus, 0.01, 1e8)
+    irf_center = params[n_comp] if use_irf else 0.0
+    irf_sigma = abs(params[n_comp + 1]) if use_irf else 0.0
+    C = _ga_build_C(t, taus, model_type, use_irf, irf_center, irf_sigma)
+    try:
+        SAS = np.linalg.lstsq(C, D.T, rcond=None)[0]
+    except Exception:
+        return D.ravel()
+    fit = C @ SAS
+    return (D.T - fit).ravel()
+
+def run_global_analysis(wl, t, D, n_comp, tau_guesses, model_type="parallel",
+                        use_irf=False, irf_center=0.3, irf_width=0.1):
+    """Run global analysis and return results dict."""
+    p0 = list(tau_guesses[:n_comp])
+    lb = [0.01] * n_comp
+    ub = [1e8] * n_comp
+    if use_irf:
+        p0 += [irf_center, irf_width]
+        lb += [-10.0, 0.01]
+        ub += [10.0, 5.0]
+
+    result = least_squares(
+        _ga_residuals_flat, p0,
+        args=(t, D, n_comp, model_type, use_irf),
+        bounds=(lb, ub), method='trf',
+        max_nfev=500 * len(p0),
+        x_scale='jac', verbose=0
+    )
+
+    opt_taus = np.abs(result.x[:n_comp])
+    opt_taus = np.clip(opt_taus, 0.01, 1e8)
+    irf_c_opt = result.x[n_comp] if use_irf else None
+    irf_w_opt = abs(result.x[n_comp + 1]) if use_irf else None
+
+    C_final = _ga_build_C(t, opt_taus, model_type, use_irf,
+                          irf_c_opt if irf_c_opt is not None else 0.0,
+                          irf_w_opt if irf_w_opt is not None else 0.0)
+
+    SAS_final = np.linalg.lstsq(C_final, D.T, rcond=None)[0]
+    D_fit = (C_final @ SAS_final).T
+    D_res = D - D_fit
+
+    ss_res = np.sum(D_res ** 2)
+    ss_tot = np.sum((D - np.mean(D)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+    sort_idx = np.argsort(opt_taus)
+    opt_taus = opt_taus[sort_idx]
+    SAS_final = SAS_final[sort_idx, :]
+    C_final = C_final[:, sort_idx]
+
+    return {
+        "taus": opt_taus,
+        "SAS": SAS_final,
+        "C": C_final,
+        "D_fit": D_fit,
+        "D_res": D_res,
+        "r2": r2,
+        "rmse": np.sqrt(np.mean(D_res ** 2)),
+        "nfev": result.nfev,
+        "cost": result.cost,
+        "irf_center": irf_c_opt,
+        "irf_width": irf_w_opt,
+        "model_type": model_type,
+    }
+
 CS_OPTS=["RdBu_r","RdBu","Spectral_r","Spectral","Viridis","Plasma","Inferno","Magma","Cividis","Turbo","PiYG_r","PiYG","BrBG_r","BrBG","PRGn_r","PRGn","RdYlBu_r","RdYlBu","RdYlGn_r","RdYlGn","Hot","Jet","Rainbow","Greys","Blues","Reds","Greens","Portland","Picnic","Earth","Electric","Blackbody"]
 LC=["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf","#ff6347","#4682b4"]
 
@@ -125,7 +254,7 @@ if not uf:
     st.info("👈 Upload CSV to begin.")
     st.stop()
 
-tab1,tab2,tab3,tab4 = st.tabs(["🔧 Preprocessing","📊 Visualization","📈 Kinetic Fitting","🧩 SVD Analysis"])
+tab1,tab2,tab3,tab4,tab5 = st.tabs(["🔧 Preprocessing","📊 Visualization","📈 Kinetic Fitting","🧩 SVD Analysis","🌐 Global Analysis"])
 
 # ═══ TAB 1 ═══
 with tab1:
@@ -169,12 +298,12 @@ with tab1:
                 if st.button("🗑️ Clear", key="ccp"): st.session_state.cp=[]; st.rerun()
             st.markdown(f"**{len(st.session_state.cp)} pts**")
             if st.session_state.cp:
-                st.dataframe(pd.DataFrame(st.session_state.cp, columns=["λ","t₀"]), use_container_width=True, hide_index=True, height=180)
+                st.dataframe(pd.DataFrame(st.session_state.cp, columns=["λ","t₀"]), hide_index=True, height=180)
         with cm1:
             em = (time_delays>-0.5)&(time_delays<10); te=time_delays[em]; de=wd[:,em]
             fcm = go.Figure(data=go.Heatmap(z=de.T, x=wavelengths, y=te, colorscale="RdBu_r",
                 zmin=-np.nanmax(np.abs(de))*.8, zmax=np.nanmax(np.abs(de))*.8,
-                colorbar=dict(title=dict(text="ΔOD")),
+                colorbar_title="ΔOD",
                 hovertemplate="λ:%{x:.1f}nm<br>t:%{y:.3f}ps<br>ΔOD:%{z:.5f}<extra></extra>"))
             if st.session_state.cp:
                 pw=[p[0] for p in st.session_state.cp]; pt=[p[1] for p in st.session_state.cp]
@@ -279,13 +408,13 @@ with tab2:
         tt=["0.1","0.5","1","5","10","50","100","500","1k","5k"]
         if swap:
             fh = go.Figure(data=go.Heatmap(z=ds.T,x=ws,y=lt,colorscale=cs,zmin=zmn,zmax=zmx,
-                colorbar=dict(title=dict(text="ΔOD",side="right")),
+                colorbar_title="ΔOD",
                 hovertemplate="λ:%{x:.1f}nm<br>t:%{customdata:.2f}ps<br>ΔOD:%{z:.5f}<extra></extra>",
                 customdata=np.tile(ts2,(len(ws),1)).T))
             fh.update_layout(xaxis_title="λ (nm)",yaxis_title="Time (ps)",height=500,margin=dict(t=20,b=50,l=60,r=20),yaxis=dict(tickvals=tv,ticktext=tt))
         else:
             fh = go.Figure(data=go.Heatmap(z=ds,x=lt,y=ws,colorscale=cs,zmin=zmn,zmax=zmx,
-                colorbar=dict(title=dict(text="ΔOD",side="right")),
+                colorbar_title="ΔOD",
                 hovertemplate="λ:%{y:.1f}nm<br>t:%{customdata:.2f}ps<br>ΔOD:%{z:.5f}<extra></extra>",
                 customdata=np.tile(ts2,(len(ws),1))))
             fh.update_layout(xaxis_title="Time (ps)",yaxis_title="λ (nm)",height=500,margin=dict(t=20,b=50,l=60,r=20),xaxis=dict(tickvals=tv,ticktext=tt))
@@ -400,8 +529,8 @@ with tab3:
         if rb and bws:
             st.subheader("Batch Results")
             br=[]
-            for ws in bws:
-                wi=np.argmin(np.abs(wavelengths-float(ws))); res,_,_=fit_kin(time_delays,data[wi,:],mt=mtp,ts=tst)
+            for ws_b in bws:
+                wi=np.argmin(np.abs(wavelengths-float(ws_b))); res,_,_=fit_kin(time_delays,data[wi,:],mt=mtp,ts=tst)
                 if res: rd={"λ":f"{wavelengths[wi]:.1f}"}; rd.update(res["params"]); rd["R²"]=res["r_squared"]; br.append(rd)
             if br:
                 bdf=pd.DataFrame(br); st.dataframe(bdf,use_container_width=True,hide_index=True)
@@ -450,13 +579,259 @@ with tab4:
         rec=U[:,:nr]@np.diag(s[:nr])@Vt[:nr,:]; res2=ds2-rec
         r1,r2=st.columns(2)
         with r1:
-            fr=go.Figure(data=go.Heatmap(z=rec,x=np.log10(ts3),y=wavelengths,colorscale="RdBu_r",zmin=-np.nanmax(np.abs(ds2))*.8,zmax=np.nanmax(np.abs(ds2))*.8,colorbar=dict(title=dict(text="ΔOD"))))
+            fr=go.Figure(data=go.Heatmap(z=rec,x=np.log10(ts3),y=wavelengths,colorscale="RdBu_r",zmin=-np.nanmax(np.abs(ds2))*.8,zmax=np.nanmax(np.abs(ds2))*.8,colorbar_title="ΔOD"))
             fr.update_layout(title=f"Recon(N={nr})",xaxis_title="Time(ps)",yaxis_title="λ(nm)",height=380,margin=dict(t=40,b=50),xaxis=dict(tickvals=[float(v) for v in np.log10([.1,1,10,100,1000])],ticktext=["0.1","1","10","100","1k"]))
             st.plotly_chart(fr, use_container_width=True)
         with r2:
-            frs=go.Figure(data=go.Heatmap(z=res2,x=np.log10(ts3),y=wavelengths,colorscale="RdBu_r",zmin=-np.nanmax(np.abs(res2)),zmax=np.nanmax(np.abs(res2)),colorbar=dict(title=dict(text="ΔOD"))))
+            frs=go.Figure(data=go.Heatmap(z=res2,x=np.log10(ts3),y=wavelengths,colorscale="RdBu_r",zmin=-np.nanmax(np.abs(res2)),zmax=np.nanmax(np.abs(res2)),colorbar_title="ΔOD"))
             frs.update_layout(title=f"Residual(RMSE:{np.sqrt(np.mean(res2**2)):.6f})",xaxis_title="Time(ps)",yaxis_title="λ(nm)",height=380,margin=dict(t=40,b=50),xaxis=dict(tickvals=[float(v) for v in np.log10([.1,1,10,100,1000])],ticktext=["0.1","1","10","100","1k"]))
             st.plotly_chart(frs, use_container_width=True)
 
+# ═══ TAB 5: Global Analysis (scipy-based) ═══
+with tab5:
+    st.header("Global / Target Analysis")
+    st.caption("Scipy-based global fitting — parallel (DADS) or sequential (EADS) decay models")
+    data = st.session_state.pd
+
+    gc1, gc2 = st.columns([1, 2])
+    with gc1:
+        st.subheader("Model Setup")
+        ga_model = st.radio("Model type", ["Parallel → DADS", "Sequential → EADS"], index=0, key="ga_model")
+        n_comp_ga = st.slider("Number of components", 1, 6, 3, key="ga_ncomp")
+        st.markdown("**Initial τ guesses (ps):**")
+        tau_guesses = []
+        default_taus = [0.5, 5, 50, 500, 5000, 50000]
+        tau_cols = st.columns(min(n_comp_ga, 3))
+        for i in range(n_comp_ga):
+            with tau_cols[i % len(tau_cols)]:
+                tg = st.number_input(f"τ{i+1}", value=default_taus[i] if i < len(default_taus) else 10.0**(i+1),
+                                     min_value=0.01, step=0.1, format="%.2f", key=f"ga_tau{i}")
+                tau_guesses.append(tg)
+
+        st.divider()
+        use_irf = st.checkbox("Enable IRF (Gaussian)", value=True, key="ga_irf_on")
+        irf_c, irf_w = 0.3, 0.1
+        if use_irf:
+            irf_c = st.number_input("IRF center (ps)", value=0.3, step=0.05, format="%.3f", key="ga_irf_c")
+            irf_w = st.number_input("IRF width σ (ps)", value=0.10, min_value=0.01, step=0.01, format="%.3f", key="ga_irf_w")
+
+        st.divider()
+        ga_tstart = st.number_input("Fit start (ps)", value=0.0, step=0.1, key="ga_tstart")
+
+        st.divider()
+        run_ga = st.button("🚀 Run Global Analysis", type="primary", use_container_width=True, key="run_ga")
+
+    with gc2:
+        if run_ga:
+            with st.spinner("Running global optimization..."):
+                try:
+                    pm_ga = time_delays >= ga_tstart
+                    t_ga = time_delays[pm_ga]
+                    D_ga = data[:, pm_ga]
+                    valid = ~np.any(np.isnan(D_ga), axis=0)
+                    t_ga = t_ga[valid]
+                    D_ga = D_ga[:, valid]
+
+                    mtype = "parallel" if "Parallel" in ga_model else "sequential"
+                    ga_res = run_global_analysis(
+                        wavelengths, t_ga, D_ga, n_comp_ga, tau_guesses,
+                        model_type=mtype, use_irf=use_irf,
+                        irf_center=irf_c, irf_width=irf_w
+                    )
+                    st.session_state.ga_result = ga_res
+                    st.session_state.ga_t = t_ga
+                    st.session_state.ga_D = D_ga
+                    st.success(f"✅ Done! (nfev: {ga_res['nfev']}, R²: {ga_res['r2']:.6f})")
+                except Exception as e:
+                    st.error(f"❌ Failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        if "ga_result" in st.session_state:
+            ga_res = st.session_state.ga_result
+            t_ga = st.session_state.ga_t
+            D_ga = st.session_state.ga_D
+            n_comp_res = len(ga_res["taus"])
+            ccl5 = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b"]
+            is_dads = ga_res["model_type"] == "parallel"
+
+            # ── Lifetimes ──
+            st.subheader("Optimized Lifetimes")
+            tc_cols = st.columns(n_comp_res + 2)
+            for j, tau in enumerate(ga_res["taus"]):
+                with tc_cols[j]:
+                    if tau < 1:
+                        st.metric(f"τ{j+1}", f"{tau*1000:.1f} fs")
+                    elif tau < 1000:
+                        st.metric(f"τ{j+1}", f"{tau:.2f} ps")
+                    else:
+                        st.metric(f"τ{j+1}", f"{tau/1000:.2f} ns")
+            with tc_cols[n_comp_res]:
+                st.metric("R²", f"{ga_res['r2']:.6f}")
+            with tc_cols[n_comp_res + 1]:
+                st.metric("RMSE", f"{ga_res['rmse']:.2e}")
+            if ga_res["irf_center"] is not None:
+                ic1, ic2 = st.columns(2)
+                with ic1: st.metric("IRF center", f"{ga_res['irf_center']:.3f} ps")
+                with ic2: st.metric("IRF width", f"{ga_res['irf_width']:.3f} ps")
+
+            st.divider()
+
+            # ── DADS / EADS ──
+            sas_label = "DADS" if is_dads else "EADS"
+            st.subheader(f"Species-Associated Spectra ({sas_label})")
+            fsas = go.Figure()
+            for k in range(n_comp_res):
+                tau = ga_res["taus"][k]
+                if tau < 1:
+                    lbl = f"τ{k+1}={tau*1000:.0f}fs"
+                elif tau < 1000:
+                    lbl = f"τ{k+1}={tau:.1f}ps"
+                else:
+                    lbl = f"τ{k+1}={tau/1000:.1f}ns"
+                fsas.add_trace(go.Scatter(
+                    x=wavelengths, y=ga_res["SAS"][k, :],
+                    mode="lines", name=lbl,
+                    line=dict(color=ccl5[k % len(ccl5)], width=2),
+                ))
+            fsas.add_hline(y=0, line_dash="dash", line_color="gray", line_width=0.5)
+            fsas.update_layout(
+                xaxis_title="Wavelength (nm)", yaxis_title=f"{sas_label} (ΔOD)",
+                height=400, margin=dict(t=20, b=50),
+                legend=dict(font=dict(size=11)),
+            )
+            st.plotly_chart(fsas, use_container_width=True)
+
+            # ── Concentration profiles ──
+            st.subheader("Concentration Profiles")
+            fconc = go.Figure()
+            for k in range(n_comp_res):
+                tau = ga_res["taus"][k]
+                if tau < 1:
+                    lbl = f"S{k+1} (τ={tau*1000:.0f}fs)"
+                elif tau < 1000:
+                    lbl = f"S{k+1} (τ={tau:.1f}ps)"
+                else:
+                    lbl = f"S{k+1} (τ={tau/1000:.1f}ns)"
+                fconc.add_trace(go.Scatter(
+                    x=t_ga, y=ga_res["C"][:, k],
+                    mode="lines", name=lbl,
+                    line=dict(color=ccl5[k % len(ccl5)], width=2),
+                ))
+            fconc.update_layout(
+                xaxis_title="Time (ps)", yaxis_title="Population",
+                xaxis_type="log", height=350, margin=dict(t=20, b=50),
+                xaxis=dict(tickvals=[.1, 1, 10, 100, 1000, 5000],
+                           ticktext=["0.1", "1", "10", "100", "1k", "5k"]),
+            )
+            st.plotly_chart(fconc, use_container_width=True)
+
+            st.divider()
+
+            # ── Fitted vs Residual heatmaps ──
+            st.subheader("Fit Quality")
+            fq1, fq2 = st.columns(2)
+            lt_ga = np.log10(np.maximum(t_ga, 1e-6))
+            tv_ga = [float(v) for v in np.log10([.1, 1, 10, 100, 1000])]
+            tt_ga = ["0.1", "1", "10", "100", "1k"]
+            zmx_ga = float(np.nanmax(np.abs(D_ga))) * 0.8
+
+            with fq1:
+                f_fit = go.Figure(data=go.Heatmap(
+                    z=ga_res["D_fit"], x=lt_ga, y=wavelengths,
+                    colorscale="RdBu_r", zmin=-zmx_ga, zmax=zmx_ga,
+                    colorbar_title="ΔOD",
+                ))
+                f_fit.update_layout(
+                    title="Fitted", xaxis_title="Time (ps)", yaxis_title="λ (nm)",
+                    height=380, margin=dict(t=40, b=50),
+                    xaxis=dict(tickvals=tv_ga, ticktext=tt_ga),
+                )
+                st.plotly_chart(f_fit, use_container_width=True)
+
+            with fq2:
+                zmx_res = float(np.nanmax(np.abs(ga_res["D_res"])))
+                f_res = go.Figure(data=go.Heatmap(
+                    z=ga_res["D_res"], x=lt_ga, y=wavelengths,
+                    colorscale="RdBu_r", zmin=-zmx_res, zmax=zmx_res,
+                    colorbar_title="ΔOD",
+                ))
+                f_res.update_layout(
+                    title=f"Residual (RMSE: {ga_res['rmse']:.2e})",
+                    xaxis_title="Time (ps)", yaxis_title="λ (nm)",
+                    height=380, margin=dict(t=40, b=50),
+                    xaxis=dict(tickvals=tv_ga, ticktext=tt_ga),
+                )
+                st.plotly_chart(f_res, use_container_width=True)
+
+            st.divider()
+
+            # ── Kinetic trace comparison ──
+            st.subheader("Kinetic Trace Comparison (Data vs Fit)")
+            ga_wl_sel = st.multiselect(
+                "Select wavelengths (nm)",
+                options=[f"{w:.1f}" for w in wavelengths],
+                default=[f"{wavelengths[np.argmin(np.abs(wavelengths - d))]:.1f}"
+                         for d in [500, 600, 700] if wavelengths[0] <= d <= wavelengths[-1]],
+                max_selections=6, key="ga_wl_comp"
+            )
+            if ga_wl_sel:
+                n_sel = len(ga_wl_sel)
+                fcomp = make_subplots(
+                    rows=n_sel, cols=1, shared_xaxes=True,
+                    vertical_spacing=0.04,
+                    subplot_titles=[f"λ = {w} nm" for w in ga_wl_sel],
+                )
+                for idx, wstr in enumerate(ga_wl_sel):
+                    wv = float(wstr)
+                    wi = np.argmin(np.abs(wavelengths - wv))
+                    fcomp.add_trace(go.Scatter(
+                        x=t_ga, y=D_ga[wi, :],
+                        mode="markers", name="Data" if idx == 0 else None,
+                        marker=dict(size=3, color="gray", opacity=0.4),
+                        showlegend=(idx == 0), legendgroup="data",
+                    ), row=idx + 1, col=1)
+                    fcomp.add_trace(go.Scatter(
+                        x=t_ga, y=ga_res["D_fit"][wi, :],
+                        mode="lines", name="Fit" if idx == 0 else None,
+                        line=dict(color="#FF5722", width=1.5),
+                        showlegend=(idx == 0), legendgroup="fit",
+                    ), row=idx + 1, col=1)
+                    fcomp.update_xaxes(type="log", row=idx + 1, col=1)
+                    fcomp.update_yaxes(title_text="ΔOD", row=idx + 1, col=1)
+                fcomp.update_xaxes(
+                    title_text="Time (ps)", row=n_sel, col=1,
+                    tickvals=[.1, 1, 10, 100, 1000], ticktext=["0.1", "1", "10", "100", "1k"],
+                )
+                fcomp.update_layout(height=200 * n_sel + 80, margin=dict(t=40, b=50))
+                st.plotly_chart(fcomp, use_container_width=True)
+
+            st.divider()
+
+            # ── Export ──
+            with st.expander("📥 Export Global Analysis Results"):
+                ex1, ex2, ex3 = st.columns(3)
+                sas_df = pd.DataFrame(ga_res["SAS"].T, index=pd.Index(wavelengths, name="λ"),
+                                      columns=[f"τ{k+1}={ga_res['taus'][k]:.2f}ps" for k in range(n_comp_res)])
+                buf_sas = io.BytesIO(); sas_df.to_excel(buf_sas, sheet_name=sas_label); buf_sas.seek(0)
+                with ex1:
+                    st.download_button(f"📥 {sas_label}", buf_sas, file_name=f"TA_{sas_label}.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                conc_df = pd.DataFrame(ga_res["C"], index=pd.Index(t_ga, name="t(ps)"),
+                                       columns=[f"S{k+1}" for k in range(n_comp_res)])
+                buf_c = io.BytesIO(); conc_df.to_excel(buf_c, sheet_name="Conc"); buf_c.seek(0)
+                with ex2:
+                    st.download_button("📥 Concentrations", buf_c, file_name="TA_GA_conc.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                tau_df = pd.DataFrame({
+                    "Component": [f"S{k+1}" for k in range(n_comp_res)],
+                    "τ (ps)": ga_res["taus"],
+                    "k (ps⁻¹)": [1.0 / t for t in ga_res["taus"]],
+                })
+                buf_tau = io.BytesIO(); tau_df.to_excel(buf_tau, index=False, sheet_name="Lifetimes"); buf_tau.seek(0)
+                with ex3:
+                    st.download_button("📥 Lifetimes", buf_tau, file_name="TA_GA_lifetimes.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 st.divider()
-st.caption("**TA Data Analyzer** v2.0 | Built with Streamlit & Plotly")
+st.caption("**TA Data Analyzer** v3.0 | Built with Streamlit & Plotly")
