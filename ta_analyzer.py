@@ -600,7 +600,7 @@ with tab5:
         n_comp_ga = st.slider("Number of components", 1, 6, 3, key="ga_ncomp")
         st.markdown("**Initial τ guesses (ps):**")
         tau_guesses = []
-        default_taus = [0.5, 5, 50, 500, 5000, 50000]
+        default_taus = [0.5, 5.0, 50.0, 500.0, 5000.0, 50000.0]
         tau_cols = st.columns(min(n_comp_ga, 3))
         for i in range(n_comp_ga):
             with tau_cols[i % len(tau_cols)]:
