@@ -381,20 +381,62 @@ with tab1:
 with tab2:
     st.header("Data Visualization")
     data = st.session_state.pd
+
+    # ── Range controls ──
     with st.expander("🔍 Range", expanded=False):
         r1,r2 = st.columns(2)
         with r1: wlr = st.slider("λ (nm)", float(wavelengths[0]),float(wavelengths[-1]),(float(wavelengths[0]),float(wavelengths[-1])))
         with r2:
-            pt2=time_delays[time_delays>0]; tlm=float(np.log10(max(pt2[0],.01))); tlx=float(np.log10(pt2[-1]))
-            tlr=st.slider("Time (log₁₀ ps)",tlm,tlx,(tlm,tlx),step=0.1)
+            tmin_all = float(time_delays[0]); tmax_all = float(time_delays[-1])
+            tr_range = st.slider("Time (ps)", tmin_all, tmax_all, (tmin_all, tmax_all), step=0.1, key="t_range_vis")
     wm=(wavelengths>=wlr[0])&(wavelengths<=wlr[1])
-    tm2=(time_delays>0)&(time_delays>=10**tlr[0])&(time_delays<=10**tlr[1])
+    tm2=(time_delays>=tr_range[0])&(time_delays<=tr_range[1])
     ws,ts2,ds = wavelengths[wm], time_delays[tm2], data[np.ix_(wm,tm2)]
+
+    # ── Helper: build lin-log axis (linear for t<t_break, log for t>=t_break) ──
+    def build_linlog_x(t_arr, t_break=2.0):
+        """Map time values to a lin-log concatenated axis.
+        Returns mapped x-values, tick positions, tick labels."""
+        lin_mask = t_arr < t_break
+        log_mask = t_arr >= t_break
+        x_out = np.zeros_like(t_arr, dtype=float)
+        # Linear part: map directly
+        x_out[lin_mask] = t_arr[lin_mask]
+        # Log part: offset so that t_break maps continuously
+        if np.any(log_mask):
+            x_out[log_mask] = t_break + (np.log10(t_arr[log_mask]) - np.log10(t_break))
+        # Build ticks
+        lin_ticks_vals = []
+        lin_ticks_text = []
+        # Linear ticks: from min to t_break
+        t_start = t_arr[0]
+        if t_start < 0:
+            for tv in [-5,-2,-1,-0.5,0,0.5,1]:
+                if t_start <= tv < t_break:
+                    lin_ticks_vals.append(tv)
+                    lin_ticks_text.append(f"{tv:.1f}" if tv != 0 else "0")
+        else:
+            for tv in [0,0.5,1]:
+                if t_start <= tv < t_break:
+                    lin_ticks_vals.append(tv)
+                    lin_ticks_text.append(f"{tv:.1f}" if tv != 0 else "0")
+        # Log ticks
+        log_candidates = [2,5,10,50,100,500,1000,5000]
+        for tv in log_candidates:
+            if tv >= t_break and tv <= t_arr[-1]:
+                mapped = t_break + (np.log10(tv) - np.log10(t_break))
+                lin_ticks_vals.append(mapped)
+                if tv >= 1000:
+                    lin_ticks_text.append(f"{tv/1000:.0f}k")
+                else:
+                    lin_ticks_text.append(f"{tv:.0f}")
+        return x_out, lin_ticks_vals, lin_ticks_text
 
     st.subheader("2D ΔOD Heatmap")
     h1,h2 = st.columns([3,1])
     with h2:
         swap = st.checkbox("Swap axes", value=False, key="swap")
+        taxis_mode = st.radio("Time axis", ["Log (t>0 only)", "Lin-Log", "Linear"], index=0, key="hm_taxis")
         st.markdown("**Color**")
         cmod = st.radio("Mode", ["Preset","Custom 11-stop","Asymmetric zero-white"], key="cm")
         if cmod=="Preset":
@@ -414,9 +456,12 @@ with tab2:
             st.info("ΔOD=0→white, asymmetric range.")
             rv = st.checkbox("Reverse", value=False, key="r3")
         st.markdown("**Range**")
-        vmx = float(np.nanmax(np.abs(ds)))
+        if ds.size > 0:
+            vmx = float(np.nanmax(np.abs(ds)))
+        else:
+            vmx = 0.001
         if cmod=="Asymmetric zero-white":
-            dmn,dmx = float(np.nanmin(ds)), float(np.nanmax(ds))
+            dmn,dmx = float(np.nanmin(ds)) if ds.size>0 else -0.001, float(np.nanmax(ds)) if ds.size>0 else 0.001
             amn = st.slider("Min ΔOD", float(dmn*1.5), 0.0, float(dmn), step=.001, format="%.4f", key="amn")
             amx = st.slider("Max ΔOD", 0.0, float(dmx*1.5), float(dmx), step=.001, format="%.4f", key="amx")
             zmn,zmx = amn,amx
@@ -426,34 +471,63 @@ with tab2:
         else:
             sym = st.checkbox("Symmetric", value=True, key="sy")
             if sym:
-                cl = st.slider("±ΔOD", .001, float(vmx), float(vmx*.8), step=.001, format="%.3f")
+                cl = st.slider("±ΔOD", .001, max(float(vmx),0.002), float(vmx*.8), step=.001, format="%.3f")
                 zmn,zmx = -cl,cl
-            else: zmn,zmx = float(np.nanmin(ds)),float(np.nanmax(ds))
+            else: zmn,zmx = float(np.nanmin(ds)) if ds.size>0 else -0.001, float(np.nanmax(ds)) if ds.size>0 else 0.001
+        if taxis_mode == "Lin-Log":
+            tbreak_hm = st.number_input("Lin→Log break (ps)", value=2.0, min_value=0.1, step=0.5, format="%.1f", key="hm_tbreak")
     with h1:
-        lt = np.log10(ts2)
-        tv=[float(v) for v in np.log10([.1,.5,1,5,10,50,100,500,1000,5000])]
-        tt=["0.1","0.5","1","5","10","50","100","500","1k","5k"]
-        if swap:
-            fh = go.Figure(data=go.Heatmap(z=ds.T,x=ws,y=lt,colorscale=cs,zmin=zmn,zmax=zmx,
-                colorbar_title="ΔOD",
-                hovertemplate="λ:%{x:.1f}nm<br>t:%{customdata:.2f}ps<br>ΔOD:%{z:.5f}<extra></extra>",
-                customdata=np.tile(ts2,(len(ws),1)).T))
-            fh.update_layout(xaxis_title="λ (nm)",yaxis_title="Time (ps)",height=500,margin=dict(t=20,b=50,l=60,r=20),yaxis=dict(tickvals=tv,ticktext=tt))
+        if ds.size > 0:
+            if taxis_mode == "Log (t>0 only)":
+                # Filter positive times only
+                tp_mask = ts2 > 0
+                ts_plot = ts2[tp_mask]
+                ds_plot = ds[:, tp_mask] if not swap else ds[:, tp_mask]
+                lt = np.log10(ts_plot)
+                tv=[float(v) for v in np.log10([.1,.5,1,5,10,50,100,500,1000,5000]) if .1 <= v*0+10**v <= ts_plot[-1]*1.1]
+                tv=[float(np.log10(v)) for v in [.1,.5,1,5,10,50,100,500,1000,5000] if v >= ts_plot[0]*0.9 and v <= ts_plot[-1]*1.1]
+                tt=[("0.1" if v==.1 else "0.5" if v==.5 else f"{int(v)}" if v<1000 else f"{v/1000:.0f}k") for v in [.1,.5,1,5,10,50,100,500,1000,5000] if v >= ts_plot[0]*0.9 and v <= ts_plot[-1]*1.1]
+                x_vals = lt
+                xtv, xtt = tv, tt
+                cd = np.tile(ts_plot,(len(ws),1))
+            elif taxis_mode == "Lin-Log":
+                x_vals, xtv, xtt = build_linlog_x(ts2, tbreak_hm)
+                cd = np.tile(ts2,(len(ws),1))
+                ds_plot = ds
+            else:  # Linear
+                x_vals = ts2
+                xtv = None
+                xtt = None
+                cd = np.tile(ts2,(len(ws),1))
+                ds_plot = ds
+
+            if swap:
+                fh = go.Figure(data=go.Heatmap(z=ds_plot.T,x=ws,y=x_vals,colorscale=cs,zmin=zmn,zmax=zmx,
+                    colorbar_title="ΔOD",
+                    hovertemplate="λ:%{x:.1f}nm<br>t:%{customdata:.3f}ps<br>ΔOD:%{z:.5f}<extra></extra>",
+                    customdata=cd.T))
+                ly = dict(xaxis_title="λ (nm)",yaxis_title="Time (ps)",height=500,margin=dict(t=20,b=50,l=60,r=20))
+                if xtv is not None: ly["yaxis"] = dict(tickvals=xtv,ticktext=xtt)
+                fh.update_layout(**ly)
+            else:
+                fh = go.Figure(data=go.Heatmap(z=ds_plot,x=x_vals,y=ws,colorscale=cs,zmin=zmn,zmax=zmx,
+                    colorbar_title="ΔOD",
+                    hovertemplate="λ:%{y:.1f}nm<br>t:%{customdata:.3f}ps<br>ΔOD:%{z:.5f}<extra></extra>",
+                    customdata=cd))
+                ly = dict(xaxis_title="Time (ps)",yaxis_title="λ (nm)",height=500,margin=dict(t=20,b=50,l=60,r=20))
+                if xtv is not None: ly["xaxis"] = dict(tickvals=xtv,ticktext=xtt)
+                fh.update_layout(**ly)
+            st.plotly_chart(fh, use_container_width=True)
         else:
-            fh = go.Figure(data=go.Heatmap(z=ds,x=lt,y=ws,colorscale=cs,zmin=zmn,zmax=zmx,
-                colorbar_title="ΔOD",
-                hovertemplate="λ:%{y:.1f}nm<br>t:%{customdata:.2f}ps<br>ΔOD:%{z:.5f}<extra></extra>",
-                customdata=np.tile(ts2,(len(ws),1))))
-            fh.update_layout(xaxis_title="Time (ps)",yaxis_title="λ (nm)",height=500,margin=dict(t=20,b=50,l=60,r=20),xaxis=dict(tickvals=tv,ticktext=tt))
-        st.plotly_chart(fh, use_container_width=True)
+            st.warning("No data in selected range.")
     st.divider()
 
     s1,s2 = st.columns(2)
     with s1:
         st.subheader("Spectral Slices")
-        avt=time_delays[time_delays>0]; dft=[.5,1,5,10,50,100,500,1000]
+        avt=time_delays; dft=[-1,0,0.5,1,5,10,50,100,500,1000]
         to = st.multiselect("Time (ps)", options=[f"{t:.2f}" for t in avt],
-            default=[f"{avt[np.argmin(np.abs(avt-d))]:.2f}" for d in dft if d<=avt[-1]], max_selections=12)
+            default=[f"{avt[np.argmin(np.abs(avt-d))]:.2f}" for d in dft if tmin_all<=d<=tmax_all], max_selections=12)
         nsm = st.radio("Normalize", ["None","Max |ΔOD|","At specific λ"], horizontal=True, key="ns")
         nwl = None
         if nsm=="At specific λ":
@@ -478,11 +552,13 @@ with tab2:
         dw=[550,610,660,700,750]
         wo = st.multiselect("λ (nm)", options=[f"{w:.1f}" for w in wavelengths],
             default=[f"{wavelengths[np.argmin(np.abs(wavelengths-d))]:.1f}" for d in dw if wavelengths[0]<=d<=wavelengths[-1]], max_selections=10)
-        tsc = st.radio("Time axis", ["Log","Linear"], horizontal=True, key="tsc")
+        tsc = st.radio("Time axis", ["Log","Linear","Lin-Log"], horizontal=True, key="tsc")
         nkm = st.radio("Normalize", ["None","Max |ΔOD|","At specific time"], horizontal=True, key="nk")
         nkt = None
         if nkm=="At specific time":
-            nkt = st.number_input("Norm t (ps)", min_value=float(ts2[0]) if len(ts2)>0 else .1, max_value=float(ts2[-1]) if len(ts2)>0 else 5000., value=1.0, step=.1, key="nkt")
+            nkt = st.number_input("Norm t (ps)", min_value=float(ts2[0]) if len(ts2)>0 else 0.1, max_value=float(ts2[-1]) if len(ts2)>0 else 5000., value=1.0, step=0.1, key="nkt")
+        if tsc=="Lin-Log":
+            tbreak_kin = st.number_input("Lin→Log break (ps)", value=2.0, min_value=0.1, step=0.5, format="%.1f", key="kin_tbreak")
         if wo:
             fk = go.Figure()
             for k,wstr in enumerate(wo):
@@ -491,13 +567,22 @@ with tab2:
                 elif nkm=="At specific time" and nkt:
                     tni=np.argmin(np.abs(ts2-nkt)); nv=tr[tni]
                     if abs(nv)>1e-10: tr=tr/nv
-                fk.add_trace(go.Scatter(x=ts2,y=tr,mode="lines",name=f"{wavelengths[wi]:.1f}nm",line=dict(color=LC[k%len(LC)],width=1.5)))
+                if tsc=="Lin-Log":
+                    x_kin, _, _ = build_linlog_x(ts2, tbreak_kin)
+                    fk.add_trace(go.Scatter(x=x_kin,y=tr,mode="lines",name=f"{wavelengths[wi]:.1f}nm",
+                        line=dict(color=LC[k%len(LC)],width=1.5),
+                        customdata=ts2, hovertemplate="t:%{customdata:.3f}ps<br>ΔOD:%{y:.5f}<extra></extra>"))
+                else:
+                    fk.add_trace(go.Scatter(x=ts2,y=tr,mode="lines",name=f"{wavelengths[wi]:.1f}nm",line=dict(color=LC[k%len(LC)],width=1.5)))
             fk.add_hline(y=0,line_dash="dash",line_color="gray",line_width=.5)
             ykl = "ΔOD" if nkm=="None" else ("Norm. ΔOD" if nkm=="Max |ΔOD|" else f"ΔOD/ΔOD(t={nkt:.1f}ps)")
             lk=dict(xaxis_title="Time(ps)",yaxis_title=ykl,height=420,margin=dict(t=20,b=50),legend=dict(font=dict(size=10)))
             if tsc=="Log":
                 lk["xaxis_type"]="log"
                 lk["xaxis"]=dict(tickvals=[.1,.5,1,5,10,50,100,500,1000,5000],ticktext=["0.1","0.5","1","5","10","50","100","500","1k","5k"])
+            elif tsc=="Lin-Log":
+                _, xtv_kin, xtt_kin = build_linlog_x(ts2, tbreak_kin)
+                lk["xaxis"]=dict(tickvals=xtv_kin, ticktext=xtt_kin)
             fk.update_layout(**lk)
             st.plotly_chart(fk, use_container_width=True)
     st.divider()
