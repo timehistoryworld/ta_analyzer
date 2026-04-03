@@ -151,25 +151,29 @@ def _ga_convolve_irf(C, t, irf_sigma):
         C_conv[:, j] = gaussian_filter1d(C[:, j], sigma_pts, mode='constant', cval=0.0)
     return C_conv
 
-def _ga_build_C(t, taus, model_type, use_irf, irf_center, irf_sigma):
-    """Build concentration matrix with optional IRF."""
-    t_shifted = t - irf_center if use_irf else t
+def _ga_build_C(t, taus, model_type, irf_center, irf_sigma):
+    """Build concentration matrix with IRF convolution.
+    irf_center shifts t0, irf_sigma is Gaussian width for convolution."""
+    t_shifted = t - irf_center
     t_shifted = np.maximum(t_shifted, 0.0)
     if model_type == "parallel":
         C = _ga_parallel_C(t_shifted, taus)
     else:
         C = _ga_sequential_C(t_shifted, taus)
-    if use_irf and irf_sigma > 0:
+    if irf_sigma > 0:
         C = _ga_convolve_irf(C, t, irf_sigma)
     return C
 
-def _ga_residuals_flat(params, t, D, n_comp, model_type, use_irf):
-    """Compute flattened residuals for least_squares."""
-    taus = np.abs(params[:n_comp])
+def _ga_residuals_flat(params, t, D, n_comp, model_type, irf_sigma, fixed_mask, full_p0):
+    """Compute flattened residuals for least_squares.
+    Parameter vector: [tau_1, ..., tau_n, irf_center]
+    fixed_mask: bool array (length n_comp+1), True = fixed."""
+    full_params = np.array(full_p0, dtype=float)
+    full_params[~fixed_mask] = params
+    taus = np.abs(full_params[:n_comp])
     taus = np.clip(taus, 0.01, 1e8)
-    irf_center = params[n_comp] if use_irf else 0.0
-    irf_sigma = abs(params[n_comp + 1]) if use_irf else 0.0
-    C = _ga_build_C(t, taus, model_type, use_irf, irf_center, irf_sigma)
+    irf_center = full_params[n_comp]
+    C = _ga_build_C(t, taus, model_type, irf_center, irf_sigma)
     try:
         SAS = np.linalg.lstsq(C, D.T, rcond=None)[0]
     except Exception:
@@ -178,33 +182,62 @@ def _ga_residuals_flat(params, t, D, n_comp, model_type, use_irf):
     return (D.T - fit).ravel()
 
 def run_global_analysis(wl, t, D, n_comp, tau_guesses, model_type="parallel",
-                        use_irf=False, irf_center=0.3, irf_width=0.1):
-    """Run global analysis and return results dict."""
-    p0 = list(tau_guesses[:n_comp])
-    lb = [0.01] * n_comp
-    ub = [1e8] * n_comp
-    if use_irf:
-        p0 += [irf_center, irf_width]
-        lb += [-10.0, 0.01]
-        ub += [10.0, 5.0]
+                        irf_center=0.0, irf_width=0.2,
+                        tau_fixed=None, irf_center_fixed=False):
+    """Run global analysis with variable projection.
+    Parameters: [tau_1,...,tau_n, irf_center], each can be fixed."""
+    if tau_fixed is None:
+        tau_fixed = [False] * n_comp
+
+    # Build full parameter vector: [taus..., irf_center]
+    full_p0 = list(tau_guesses[:n_comp]) + [irf_center]
+    full_lb = [0.01] * n_comp + [-5.0]
+    full_ub = [1e8] * n_comp + [5.0]
+    fixed_mask = np.array(list(tau_fixed[:n_comp]) + [irf_center_fixed], dtype=bool)
+
+    # Extract free parameters only
+    free_p0 = [p for p, f in zip(full_p0, fixed_mask) if not f]
+    free_lb = [lb for lb, f in zip(full_lb, fixed_mask) if not f]
+    free_ub = [ub for ub, f in zip(full_ub, fixed_mask) if not f]
+
+    irf_sigma = abs(irf_width)
+
+    if len(free_p0) == 0:
+        # All fixed — just compute SAS directly
+        taus = np.array(full_p0[:n_comp])
+        C_final = _ga_build_C(t, taus, model_type, irf_center, irf_sigma)
+        SAS_final = np.linalg.lstsq(C_final, D.T, rcond=None)[0]
+        D_fit = (C_final @ SAS_final).T
+        D_res = D - D_fit
+        ss_res = np.sum(D_res ** 2)
+        ss_tot = np.sum((D - np.mean(D)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+        sort_idx = np.argsort(taus)
+        return {
+            "taus": taus[sort_idx], "SAS": SAS_final[sort_idx, :],
+            "C": C_final[:, sort_idx], "D_fit": D_fit, "D_res": D_res,
+            "r2": r2, "rmse": np.sqrt(np.mean(D_res ** 2)),
+            "nfev": 0, "cost": ss_res,
+            "irf_center": irf_center, "irf_width": irf_width,
+            "model_type": model_type,
+        }
 
     result = least_squares(
-        _ga_residuals_flat, p0,
-        args=(t, D, n_comp, model_type, use_irf),
-        bounds=(lb, ub), method='trf',
-        max_nfev=500 * len(p0),
+        _ga_residuals_flat, free_p0,
+        args=(t, D, n_comp, model_type, irf_sigma, fixed_mask, full_p0),
+        bounds=(free_lb, free_ub), method='trf',
+        max_nfev=500 * len(free_p0),
         x_scale='jac', verbose=0
     )
 
-    opt_taus = np.abs(result.x[:n_comp])
+    # Reconstruct full params
+    full_opt = np.array(full_p0, dtype=float)
+    full_opt[~fixed_mask] = result.x
+    opt_taus = np.abs(full_opt[:n_comp])
     opt_taus = np.clip(opt_taus, 0.01, 1e8)
-    irf_c_opt = result.x[n_comp] if use_irf else None
-    irf_w_opt = abs(result.x[n_comp + 1]) if use_irf else None
+    opt_irf_center = full_opt[n_comp]
 
-    C_final = _ga_build_C(t, opt_taus, model_type, use_irf,
-                          irf_c_opt if irf_c_opt is not None else 0.0,
-                          irf_w_opt if irf_w_opt is not None else 0.0)
-
+    C_final = _ga_build_C(t, opt_taus, model_type, opt_irf_center, irf_sigma)
     SAS_final = np.linalg.lstsq(C_final, D.T, rcond=None)[0]
     D_fit = (C_final @ SAS_final).T
     D_res = D - D_fit
@@ -219,17 +252,11 @@ def run_global_analysis(wl, t, D, n_comp, tau_guesses, model_type="parallel",
     C_final = C_final[:, sort_idx]
 
     return {
-        "taus": opt_taus,
-        "SAS": SAS_final,
-        "C": C_final,
-        "D_fit": D_fit,
-        "D_res": D_res,
-        "r2": r2,
-        "rmse": np.sqrt(np.mean(D_res ** 2)),
-        "nfev": result.nfev,
-        "cost": result.cost,
-        "irf_center": irf_c_opt,
-        "irf_width": irf_w_opt,
+        "taus": opt_taus, "SAS": SAS_final, "C": C_final,
+        "D_fit": D_fit, "D_res": D_res,
+        "r2": r2, "rmse": np.sqrt(np.mean(D_res ** 2)),
+        "nfev": result.nfev, "cost": result.cost,
+        "irf_center": opt_irf_center, "irf_width": irf_width,
         "model_type": model_type,
     }
 
@@ -598,25 +625,37 @@ with tab5:
         st.subheader("Model Setup")
         ga_model = st.radio("Model type", ["Parallel → DADS", "Sequential → EADS"], index=0, key="ga_model")
         n_comp_ga = st.slider("Number of components", 1, 6, 3, key="ga_ncomp")
+
         st.markdown("**Initial τ guesses (ps):**")
         tau_guesses = []
+        tau_fixed = []
         default_taus = [0.5, 5.0, 50.0, 500.0, 5000.0, 50000.0]
-        tau_cols = st.columns(min(n_comp_ga, 3))
         for i in range(n_comp_ga):
-            with tau_cols[i % len(tau_cols)]:
-                tg = st.number_input(f"τ{i+1}", value=default_taus[i] if i < len(default_taus) else 10.0**(i+1),
+            tc1, tc2 = st.columns([3, 1])
+            with tc1:
+                tg = st.number_input(f"τ{i+1} (ps)", value=default_taus[i] if i < len(default_taus) else 10.0**(i+1),
                                      min_value=0.01, step=0.1, format="%.2f", key=f"ga_tau{i}")
                 tau_guesses.append(tg)
+            with tc2:
+                fx = st.checkbox("fix", value=False, key=f"ga_fix_tau{i}")
+                tau_fixed.append(fx)
 
         st.divider()
-        use_irf = st.checkbox("Enable IRF (Gaussian)", value=True, key="ga_irf_on")
-        irf_c, irf_w = 0.3, 0.1
-        if use_irf:
-            irf_c = st.number_input("IRF center (ps)", value=0.3, step=0.05, format="%.3f", key="ga_irf_c")
-            irf_w = st.number_input("IRF width σ (ps)", value=0.10, min_value=0.01, step=0.01, format="%.3f", key="ga_irf_w")
-
-        st.divider()
-        ga_tstart = st.number_input("Fit start (ps)", value=0.0, step=0.1, key="ga_tstart")
+        st.markdown("**IRF (Gaussian)**")
+        irf_cc1, irf_cc2 = st.columns([3, 1])
+        with irf_cc1:
+            irf_center = st.number_input("IRF center t₀ (ps)", value=0.30, step=0.05, format="%.3f", key="ga_irf_c")
+        with irf_cc2:
+            st.caption("")
+            irf_c_fixed = st.checkbox("fix", value=False, key="ga_fix_irf_c")
+        irf_wc1, irf_wc2 = st.columns([3, 1])
+        with irf_wc1:
+            irf_fwhm_fs = st.number_input("IRF FWHM (fs)", value=200.0, min_value=10.0, step=10.0, format="%.0f", key="ga_irf_w")
+        with irf_wc2:
+            st.caption("")
+            irf_w_fixed = st.checkbox("fix", value=True, key="ga_fix_irf_w")
+        irf_sigma_ps = (irf_fwhm_fs / 1000.0) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        st.caption(f"σ = {irf_fwhm_fs / (2*np.sqrt(2*np.log(2))):.1f} fs = {irf_sigma_ps:.4f} ps")
 
         st.divider()
         run_ga = st.button("🚀 Run Global Analysis", type="primary", use_container_width=True, key="run_ga")
@@ -625,7 +664,7 @@ with tab5:
         if run_ga:
             with st.spinner("Running global optimization..."):
                 try:
-                    pm_ga = time_delays >= ga_tstart
+                    pm_ga = time_delays > 0
                     t_ga = time_delays[pm_ga]
                     D_ga = data[:, pm_ga]
                     valid = ~np.any(np.isnan(D_ga), axis=0)
@@ -635,8 +674,9 @@ with tab5:
                     mtype = "parallel" if "Parallel" in ga_model else "sequential"
                     ga_res = run_global_analysis(
                         wavelengths, t_ga, D_ga, n_comp_ga, tau_guesses,
-                        model_type=mtype, use_irf=use_irf,
-                        irf_center=irf_c, irf_width=irf_w
+                        model_type=mtype,
+                        irf_center=irf_center, irf_width=irf_sigma_ps,
+                        tau_fixed=tau_fixed, irf_center_fixed=irf_c_fixed,
                     )
                     st.session_state.ga_result = ga_res
                     st.session_state.ga_t = t_ga
@@ -670,10 +710,10 @@ with tab5:
                 st.metric("R²", f"{ga_res['r2']:.6f}")
             with tc_cols[n_comp_res + 1]:
                 st.metric("RMSE", f"{ga_res['rmse']:.2e}")
-            if ga_res["irf_center"] is not None:
-                ic1, ic2 = st.columns(2)
-                with ic1: st.metric("IRF center", f"{ga_res['irf_center']:.3f} ps")
-                with ic2: st.metric("IRF width", f"{ga_res['irf_width']:.3f} ps")
+            irf_fwhm_result = ga_res['irf_width'] * 1000.0 * 2.0 * np.sqrt(2.0 * np.log(2.0))
+            ic1, ic2 = st.columns(2)
+            with ic1: st.metric("IRF t₀", f"{ga_res['irf_center']:.3f} ps")
+            with ic2: st.caption(f"IRF FWHM = {irf_fwhm_result:.0f} fs (σ = {ga_res['irf_width']*1000:.1f} fs)")
 
             st.divider()
 
