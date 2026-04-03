@@ -662,10 +662,10 @@ with tab4:
     vc=~np.all(dp==0,axis=0)&~np.any(np.isnan(dp),axis=0); ds2,ts3=dp[:,vc],tp3[vc]
     if st.button("🧮 Run SVD", type="primary"):
         U,s,Vt=svd(ds2,full_matrices=False)
-        st.session_state.sU=U; st.session_state.ss=s; st.session_state.sV=Vt; st.session_state.st=ts3
+        st.session_state.sU=U; st.session_state.ss=s; st.session_state.sV=Vt; st.session_state.st=ts3; st.session_state.sD=ds2
         st.success("Done!")
     if "ss" in st.session_state:
-        s=st.session_state.ss; U=st.session_state.sU; Vt=st.session_state.sV; ts3=st.session_state.st
+        s=st.session_state.ss; U=st.session_state.sU; Vt=st.session_state.sV; ts3=st.session_state.st; ds2_svd=st.session_state.sD
         v1,v2=st.columns(2)
         with v1:
             ns2=min(20,len(s)); fsc=go.Figure()
@@ -688,10 +688,10 @@ with tab4:
             st.plotly_chart(fv, use_container_width=True)
         st.divider(); st.subheader("Reconstruction")
         nr=st.slider("N comp",1,min(10,len(s)),3,key="nr")
-        rec=U[:,:nr]@np.diag(s[:nr])@Vt[:nr,:]; res2=ds2-rec
+        rec=U[:,:nr]@np.diag(s[:nr])@Vt[:nr,:]; res2=ds2_svd-rec
         r1,r2=st.columns(2)
         with r1:
-            fr=go.Figure(data=go.Heatmap(z=rec,x=np.log10(ts3),y=wavelengths,colorscale="RdBu_r",zmin=-np.nanmax(np.abs(ds2))*.8,zmax=np.nanmax(np.abs(ds2))*.8,colorbar_title="ΔOD"))
+            fr=go.Figure(data=go.Heatmap(z=rec,x=np.log10(ts3),y=wavelengths,colorscale="RdBu_r",zmin=-np.nanmax(np.abs(ds2_svd))*.8,zmax=np.nanmax(np.abs(ds2_svd))*.8,colorbar_title="ΔOD"))
             fr.update_layout(title=f"Recon(N={nr})",xaxis_title="Time(ps)",yaxis_title="λ(nm)",height=380,margin=dict(t=40,b=50),xaxis=dict(tickvals=[float(v) for v in np.log10([.1,1,10,100,1000])],ticktext=["0.1","1","10","100","1k"]))
             st.plotly_chart(fr, use_container_width=True)
         with r2:
@@ -798,7 +798,7 @@ with tab5:
             irf_fwhm_result = ga_res['irf_width'] * 1000.0 * 2.0 * np.sqrt(2.0 * np.log(2.0))
             ic1, ic2 = st.columns(2)
             with ic1: st.metric("IRF t₀", f"{ga_res['irf_center']:.3f} ps")
-            with ic2: st.caption(f"IRF FWHM = {irf_fwhm_result:.0f} fs (σ = {ga_res['irf_width']*1000:.1f} fs)")
+            with ic2: st.metric("IRF FWHM", f"{irf_fwhm_result:.0f} fs")
 
             st.divider()
 
