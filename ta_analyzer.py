@@ -958,5 +958,95 @@ with tab5:
                     st.download_button("📥 Lifetimes", buf_tau, file_name="TA_GA_lifetimes.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+            # ── Component Subtraction / Data Reconstruction ──
+            st.divider()
+            st.subheader("Component Subtraction")
+            st.caption("Remove selected components from the original data. Result = Data − Σ(selected components)")
+
+            sub_cols = st.columns(n_comp_res)
+            remove_flags = []
+            for k in range(n_comp_res):
+                tau_v = ga_res["taus"][k]
+                if tau_v < 1: tl = f"{tau_v*1000:.0f} fs"
+                elif tau_v < 1000: tl = f"{tau_v:.1f} ps"
+                else: tl = f"{tau_v/1000:.1f} ns"
+                with sub_cols[k]:
+                    rf = st.checkbox(f"Remove S{k+1} (τ={tl})", value=False, key=f"ga_rm_{k}")
+                    remove_flags.append(rf)
+
+            if any(remove_flags):
+                # Compute contribution of each removed component
+                # SAS: (n_comp, n_wl), C: (n_t, n_comp)
+                # Component k contribution: (C[:, k:k+1] @ SAS[k:k+1, :]).T → (n_wl, n_t)
+                D_subtract = np.zeros_like(D_ga)
+                removed_labels = []
+                for k in range(n_comp_res):
+                    if remove_flags[k]:
+                        comp_k = (ga_res["C"][:, k:k+1] @ ga_res["SAS"][k:k+1, :]).T  # (n_wl, n_t)
+                        D_subtract += comp_k
+                        tau_v = ga_res["taus"][k]
+                        if tau_v < 1: removed_labels.append(f"S{k+1}(τ={tau_v*1000:.0f}fs)")
+                        elif tau_v < 1000: removed_labels.append(f"S{k+1}(τ={tau_v:.1f}ps)")
+                        else: removed_labels.append(f"S{k+1}(τ={tau_v/1000:.1f}ns)")
+
+                D_recon = D_ga - D_subtract
+
+                st.markdown(f"**Removed:** {', '.join(removed_labels)}")
+
+                # Show heatmaps: original, subtracted components, reconstructed
+                rc1, rc2, rc3 = st.columns(3)
+                lt_rc = np.log10(np.maximum(t_ga, 1e-6))
+                tv_rc = [float(np.log10(v)) for v in [.1,1,10,100,1000] if v <= t_ga[-1]*1.1]
+                tt_rc = [("0.1" if v==.1 else f"{int(v)}" if v<1000 else f"{v/1000:.0f}k") for v in [.1,1,10,100,1000] if v <= t_ga[-1]*1.1]
+                zmx_rc = float(np.nanmax(np.abs(D_ga))) * 0.8
+
+                with rc1:
+                    fig_orig = go.Figure(data=go.Heatmap(
+                        z=D_ga, x=lt_rc, y=wavelengths, colorscale="RdBu_r",
+                        zmin=-zmx_rc, zmax=zmx_rc, colorbar_title="ΔOD"))
+                    fig_orig.update_layout(title="Original", xaxis_title="Time (ps)", yaxis_title="λ (nm)",
+                        height=320, margin=dict(t=35,b=40,l=50,r=10),
+                        xaxis=dict(tickvals=tv_rc, ticktext=tt_rc))
+                    st.plotly_chart(fig_orig, use_container_width=True)
+
+                with rc2:
+                    zmx_sub = float(np.nanmax(np.abs(D_subtract))) * 0.8
+                    fig_sub = go.Figure(data=go.Heatmap(
+                        z=D_subtract, x=lt_rc, y=wavelengths, colorscale="RdBu_r",
+                        zmin=-zmx_sub, zmax=zmx_sub, colorbar_title="ΔOD"))
+                    fig_sub.update_layout(title="Subtracted", xaxis_title="Time (ps)", yaxis_title="λ (nm)",
+                        height=320, margin=dict(t=35,b=40,l=50,r=10),
+                        xaxis=dict(tickvals=tv_rc, ticktext=tt_rc))
+                    st.plotly_chart(fig_sub, use_container_width=True)
+
+                with rc3:
+                    zmx_recon = float(np.nanmax(np.abs(D_recon))) * 0.8
+                    fig_recon = go.Figure(data=go.Heatmap(
+                        z=D_recon, x=lt_rc, y=wavelengths, colorscale="RdBu_r",
+                        zmin=-zmx_recon, zmax=zmx_recon, colorbar_title="ΔOD"))
+                    fig_recon.update_layout(title="Reconstructed", xaxis_title="Time (ps)", yaxis_title="λ (nm)",
+                        height=320, margin=dict(t=35,b=40,l=50,r=10),
+                        xaxis=dict(tickvals=tv_rc, ticktext=tt_rc))
+                    st.plotly_chart(fig_recon, use_container_width=True)
+
+                # Export reconstructed data
+                ex_rc1, ex_rc2 = st.columns(2)
+                with ex_rc1:
+                    recon_df = pd.DataFrame(D_recon, index=pd.Index(wavelengths, name="λ(nm)"),
+                                            columns=[f"{t:.4f}" for t in t_ga])
+                    buf_recon = io.BytesIO(); recon_df.to_excel(buf_recon, sheet_name="Reconstructed"); buf_recon.seek(0)
+                    st.download_button("📥 Reconstructed data (Excel)", buf_recon,
+                                       file_name="TA_reconstructed.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                with ex_rc2:
+                    if st.button("📤 Use as preprocessed data", help="Replace preprocessed data with this reconstructed result for use in other tabs"):
+                        # Map back to full time array
+                        new_pd = st.session_state.pd.copy()
+                        pm_ga_full = time_delays > 0
+                        valid_full = ~np.any(np.isnan(st.session_state.pd[:, pm_ga_full]), axis=0)
+                        new_pd[:, np.where(pm_ga_full)[0][valid_full]] = D_recon
+                        st.session_state.pd = new_pd
+                        st.success("✅ Preprocessed data updated! Other tabs will now use the reconstructed data.")
+
 st.divider()
 st.caption("**TA Data Analyzer** v3.0 | Built with Streamlit & Plotly")
