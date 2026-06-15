@@ -957,6 +957,20 @@ with tab5:
                 with ex3:
                     st.download_button("📥 Lifetimes", buf_tau, file_name="TA_GA_lifetimes.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                # Fitted & Residual
+                ex4, ex5 = st.columns(2)
+                t_cols = [f"{t:.4f}" for t in t_ga]
+                wl_idx = pd.Index(wavelengths, name="λ(nm)")
+                fit_df = pd.DataFrame(ga_res["D_fit"], index=wl_idx, columns=t_cols)
+                buf_fit = io.BytesIO(); fit_df.to_excel(buf_fit, sheet_name="Fitted"); buf_fit.seek(0)
+                with ex4:
+                    st.download_button("📥 Fitted data", buf_fit, file_name="TA_GA_fitted.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                res_df = pd.DataFrame(ga_res["D_res"], index=wl_idx, columns=t_cols)
+                buf_res = io.BytesIO(); res_df.to_excel(buf_res, sheet_name="Residual"); buf_res.seek(0)
+                with ex5:
+                    st.download_button("📥 Residual", buf_res, file_name="TA_GA_residual.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             # ── Component Subtraction / Data Reconstruction ──
             st.divider()
